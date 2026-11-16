@@ -6,7 +6,7 @@
 
 栖川售后每天由8位网点值班员汇总工单到达量，排班组在 `栖川_网点日结_20261114.xlsx` 中复制上周星期分布，再手工加减人数。痛点：漏日常被当零量、趋势调整没有回测、排班人数和依据版本难追溯。上游是售后工单日结；本项目替代连续性核对、预测比较与人数换算；下游是网点负责人核对技能、休息和班次后安排人员。
 
-四个模块：日量导入（逐条表单/API，含修订）、回测设置、预测对比、排班建议。三个核心实体为DailyVolume、ForecastRun、Staffing，分别贯穿数据库、模式、业务服务/控制、路由和前端；另有用户与审计。提交任务时冻结原始记录与参数，之后补录不改变旧预测。
+四个模块：日量导入（逐条表单/API，含修订）、回测设置、预测对比、排班建议，外加撤回与对账页。三个核心实体为DailyVolume、ForecastRun、Staffing，分别贯穿数据库、模式、业务服务/控制、路由和前端；另有用户、审计与撤回单（Withdrawal/WithdrawalItem）。提交任务时冻结原始记录与参数，之后补录不改变旧预测；按网点与日期区间撤回时会清除这些冻结副本，见下文。
 
 |角色|可访问|典型动作|
 |---|---|---|
@@ -34,7 +34,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 5. 09:30 提交worker任务；刷新预测对比，检查两个模型的MAE/MAPE与回测曲线。
 6. 09:40 对比未来7日，选择与现场情况相符的模型；以每日单人12单生成排班参考。
 7. 10:00 analyst写明轮休/技能约束；10:10 admin核对并签核，不能重复签核。
-8. 10:20 viewer下载 `branch-demand-<id>.json`，作为下周排班会议的冻结证据。
+8. 10:20 viewer下载 `branch-demand-<id>.json`，作为下周排班会议的冻结证据。若演练日结误入正式预测，在“撤回与对账”按网点与日期区间预览、确认撤回，并逐项核对无残留。
 
 ## 核心算法与边界
 
@@ -61,6 +61,24 @@ docker compose exec -T backend python -m scripts.seed_demo
 环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET。显式10.253.109.0/24用于规避当前机默认网络池耗尽，移机可调整。演示凭据/JWT密钥部署时替换。本地开发可先起db/redis，在backend安装requirements，设置DATABASE_URL/REDIS_URL/JWT_SECRET，再`uvicorn src.main:app --reload`；前端沿用Nginx或同源代理。ORM建初表，migrations保留DDL，无在线版本迁移器。
 
 共享枚举：ROLES、STATES、BRANCHES、MODELS，后端src/constants/enums.py和schemas/business.py，前端src/constants/enums.js；存储列见models/entities.py。所有计算和人数换算在后端，前端只展示。
+
+## 日量撤回与对账
+
+演练日结误入正式预测时，按**网点 + 日期区间**撤回，不做单条删除。撤回只命中该网点、该区间：其他网点的日量、预测与排班不受影响。
+
+1. **预览影响**（`POST /withdrawals/preview`）：列出命中日量与日期、引用它们的预测版本（含冻结快照）、共享卷上的结果文件、以及待签核/已签核排班。
+2. **确认撤回**（`POST /withdrawals`，需带幂等 `request_key`）：先落一条 `pending` 撤回单，冻结该网点写入，并立刻把命中预测置为 `cancelled` 且清空 `result`（快照与计算结果），使旧副本无法再导出。清理在后台进行，状态 `pending → cleaning → completed`；有残留则为 `pending_cleanup`。轨迹写入撤回单 `history`，并记审计。
+3. **清理**：删除区间内日量；清除命中预测的快照、回测/未来预测等计算结果与 `/artifacts/<id>.json`；未签核排班置 `voided` 并清空人数；已签核排班转 `withdrawn`，仅保留 `{day, staff}` 并注明“依据撤回”。预测行保留一条只含 `{withdrawn, withdrawal_id}` 的墓碑，便于审计，导出返回 409。
+4. **逐项对账**（`GET /withdrawals/{id}/residue`）：按日量、预测、结果文件、排班四类重新读库核对；任何残留或文件删除失败都保持 `pending_cleanup` 并显示原因。
+
+约束与恢复：
+
+- 撤回处理中（`pending/cleaning/pending_cleanup`）该网点拒绝补录/修订日量、提交预测、生成或签核排班；导出同样被拒。完成后恢复写入（可重新补录正确值）。
+- 数据库层用触发器兜底：撤回处理中，旧进程直接 UPDATE 快照或写回区间日量会被拒绝（`55006`）。服务层另用网点级 advisory lock 串行化受理、清理、预测写回与签核。
+- 后端受理后立刻返回；清理由后台任务执行。worker 启动时把中断在 `pending/cleaning` 的撤回续跑为同一撤回单，不会重复创建；`pending_cleanup` 等待人工 `POST /withdrawals/{id}/retry`（同一撤回单，幂等）。
+- 页面“撤回与对账”提供影响预览、确认撤回、逐项对账与残留刷新、待清理重试。
+
+新增接口：`POST /withdrawals/preview`、`POST /withdrawals`、`GET /withdrawals`、`GET /withdrawals/{id}`、`GET /withdrawals/{id}/residue`、`POST /withdrawals/{id}/retry`。DDL 见 `backend/migrations/002_withdrawals.sql`。
 
 ## 范围与证据
 

@@ -1,4 +1,6 @@
 ROLES=('admin','analyst','viewer')
-STATES=('queued','running','done','failed')
+STATES=('queued','running','done','failed','cancelled')
 BRANCHES=('川北','川南','东河','西浦','新城','临港','山前','湖滨')
 MODELS=('seasonal_naive','holt')
+WITHDRAWAL_STATES=('pending','cleaning','pending_cleanup','completed')
+STAFFING_STATES=('draft','approved','voided','withdrawn')
